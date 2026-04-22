@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# 本地模型（太大不上传）
+local_models/
+*.gguf
+*.bin
+*.safetensors
+
+# Chroma数据库（可以重新生成）
+chroma_db_hybrid/
+long_term_memory_db/
+
+# 会话数据（隐私）
+data/sessions/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+*.temp
