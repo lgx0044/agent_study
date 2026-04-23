@@ -9,8 +9,6 @@ import json
 import re
 import time
 import asyncio
-import jieba
-import numpy as np
 from typing import AsyncGenerator, Optional
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +20,6 @@ from openai import OpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
-from sentence_transformers import CrossEncoder
 import torch
 from datetime import datetime
 import uuid
@@ -35,7 +32,6 @@ executor = ThreadPoolExecutor(max_workers=4)
 # ==========================================
 LLM_BASE_URL = os.getenv("LLM_URL", "http://127.0.0.1:8080/v1")
 EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_PATH", "./local_models/bge-small-zh-v1.5")
-RERANKER_MODEL_PATH = os.getenv("RERANKER_PATH", "./local_models/bge-reranker-base")
 ZIWEI_DB_DIR = "./chroma_db_hybrid"
 LONG_TERM_DB_DIR = "./long_term_memory_db"
 DATA_DIR = Path("./data/sessions")
@@ -65,66 +61,14 @@ embeddings = HuggingFaceEmbeddings(
     model_kwargs={'device': device}
 )
 
-# ─── 混合检索（向量 + BM25 + Reranker）───
 ziwei_db = None
 ziwei_retriever = None
-bm25_corpus = []
-bm25_model = None
-reranker = None
-
 try:
-    ziwei_db = Chroma(persist_directory=ZIWEI_DB_DIR, embedding_function=embeddings, collection_name="ziwei_hybrid")
-    
-    # 准备 BM25 语料
-    docs = ziwei_db.get()
-    bm25_corpus = [d for d in docs['documents'] if d.strip()]
-    bm25_corpus_docs = [Document(page_content=d) for d in bm25_corpus]
-    
-    tokenized = [list(jieba.cut(d)) for d in bm25_corpus]
-    from rank_bm25 import BM25Okapi
-    bm25_model = BM25Okapi(tokenized)
-    
-    # 加载 Reranker
-    reranker = CrossEncoder(RERANKER_MODEL_PATH, device=device)
-    
-    print(f"[*] 紫微知识库加载成功（{len(bm25_corpus)} 条 | 向量+BM25+Reranker）")
+    ziwei_db = Chroma(persist_directory=ZIWEI_DB_DIR, embedding_function=embeddings)
+    ziwei_retriever = ziwei_db.as_retriever(search_kwargs={"k": 3})
+    print("[*] 紫微知识库加载成功")
 except Exception as e:
     print(f"[!] 知识库加载失败: {e}")
-
-
-def hybrid_search(query: str, top_k: int = 10, top_n: int = 3) -> list[Document]:
-    """混合检索：向量 + BM25 → Reranker 重排"""
-    if ziwei_db is None:
-        return []
-    
-    # 向量检索
-    v_docs = ziwei_db.similarity_search(query, k=top_k)
-    
-    # BM25 检索
-    tokenized_q = list(jieba.cut(query))
-    bm25_scores = bm25_model.get_scores(tokenized_q)
-    max_score = np.max(bm25_scores)
-    if max_score > 0:
-        bm25_scores = bm25_scores / max_score
-    top_idx = np.argsort(bm25_scores)[-top_k:][::-1]
-    b_docs = [bm25_corpus_docs[i] for i in top_idx if bm25_scores[i] > 0]
-    
-    # 合并去重
-    seen = set()
-    candidates = []
-    for doc in v_docs + b_docs:
-        if doc.page_content not in seen:
-            seen.add(doc.page_content)
-            candidates.append(doc)
-    
-    # Reranker 重排
-    if reranker and candidates:
-        pairs = [[query, d.page_content] for d in candidates]
-        scores = reranker.predict(pairs)
-        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-        candidates = [d for d, _ in ranked[:top_n]]
-    
-    return candidates[:top_n]
 
 long_term_db = None
 try:
@@ -204,17 +148,11 @@ def get_all_sessions() -> list:
             pass
     return sorted(sessions, key=lambda x: x["updated_at"], reverse=True)
 
-# 内存缓存（上限 50 个，防止 OOM）
-SESSION_CACHE_MAX = 50
+# 内存缓存
 session_cache = {}
 
 def get_session(session_id: str) -> Session:
     if session_id not in session_cache:
-        # 缓存超限，清理最老的会话
-        if len(session_cache) >= SESSION_CACHE_MAX:
-            oldest = min(session_cache, key=lambda k: session_cache[k].updated_at)
-            save_session(session_cache[oldest])
-            del session_cache[oldest]
         session_cache[session_id] = load_session(session_id)
     return session_cache[session_id]
 
@@ -239,11 +177,11 @@ Final Answer: [最终给用户的自然语言回答]
 2. 回答要专业、有深度，结合紫微斗数理论"""
 
 def query_knowledge(query: str) -> str:
-    """混合检索查询紫微知识库"""
-    docs = hybrid_search(query, top_k=10, top_n=3)
-    if not docs:
-        return "未找到相关内容"
-    return "\n\n".join([d.page_content for d in docs])
+    """查询紫微知识库"""
+    if ziwei_retriever is None:
+        return "知识库未加载"
+    docs = ziwei_retriever.invoke(query)
+    return "\n".join([d.page_content for d in docs[:3]])
 
 def get_dynamic_system_prompt(session: Session, current_query: str) -> str:
     """动态组装系统提示"""
@@ -273,24 +211,45 @@ def get_dynamic_system_prompt(session: Session, current_query: str) -> str:
 
 请结合记忆和专业知识回答用户。"""
 
-async def call_llm_sync(messages, temperature=0.1, max_tokens=512):
-    """同步调用 LLM（不用 stop 参数，改用正则截断）"""
+async def stream_llm(messages, temperature=0.1, max_tokens=512):
+    """流式调用 LLM，逐 token 输出"""
     loop = asyncio.get_event_loop()
     
-    def _call():
-        resp = llm_client.chat.completions.create(
+    def _stream():
+        try:
+            response = llm_client.chat.completions.create(
+                model="qwen2.5-7b",
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True
+            )
+            full_content = ""
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_content += token
+                    yield token
+        except Exception as e:
+            yield f"[ERROR: {str(e)}]"
+    
+    # 在线程池中运行
+    for token in await loop.run_in_executor(executor, lambda: list(_stream())):
+        yield token
+
+async def call_llm_sync(messages, temperature=0.1, stop=None, max_tokens=512):
+    """同步调用 LLM"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: llm_client.chat.completions.create(
             model="qwen2.5-7b",
             messages=messages,
             temperature=temperature,
+            stop=stop,
             max_tokens=max_tokens
-        )
-        raw = resp.choices[0].message.content
-        # 正则截断：遇到 "Observation:" 或 "观察结果:" 即停止（llama.cpp 不认 stop 参数）
-        truncated = re.split(r'\n*(?=Observation:|观察结果:)', raw, maxsplit=1)[0]
-        return truncated.strip()
-    
-    return await loop.run_in_executor(executor, _call)
-
+        ).choices[0].message.content
+    )
 
 async def run_agent_stream(session: Session, user_input: str) -> AsyncGenerator[str, None]:
     """流式执行 Agent"""
@@ -321,9 +280,9 @@ async def run_agent_stream(session: Session, user_input: str) -> AsyncGenerator[
     final_answer = ""
     
     for step in range(max_iterations):
-        # 调用 LLM（正则截断已在 call_llm_sync 内部处理）
+        # 调用 LLM
         try:
-            assistant_msg = await call_llm_sync(messages, temperature=0.1)
+            assistant_msg = await call_llm_sync(messages, temperature=0.1, stop=["Observation:", "观察结果:"])
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': f'LLM 调用失败: {str(e)}'}, ensure_ascii=False)}\n\n"
             return
@@ -416,19 +375,17 @@ async def run_agent_stream(session: Session, user_input: str) -> AsyncGenerator[
     )
     session.messages.append(user_msg)
     
-    # 更新标题（回复后再命名，更智能）
-    if len(session.messages) == 4:  # 1用户 + 1助手 + 1用户 + 1助手 = 首轮完整对话
-        # 用回答的前20字作为标题
-        title_text = final_answer or user_input
-        session.title = title_text[:20].replace('\n', ' ') + ("..." if len(title_text) > 20 else "")
+    # 更新标题（如果是第一条消息）
+    if len(session.messages) == 2:
+        session.title = user_input[:20] + ("..." if len(user_input) > 20 else "")
     
     save_session(session)
     
-    # 更新长期记忆（每条回复都写，异步不阻塞）
-    if long_term_db:
+    # 更新长期记忆（如果会话很长）
+    if len(session.messages) > 10 and long_term_db:
         try:
             text = f"User: {user_input}\nAssistant: {final_answer}"
-            await loop.run_in_executor(executor, lambda t=text: long_term_db.add_documents([Document(page_content=t)]))
+            await loop.run_in_executor(executor, lambda: long_term_db.add_documents([Document(page_content=text)]))
         except:
             pass
     
@@ -568,9 +525,9 @@ async def health():
 # 启动
 # ==========================================
 print("""
-=============================================================
-  Ziwei Agent v2.1  started
-  URL: http://127.0.0.1:8000
-  Hybrid RAG: vector + BM25 + Reranker
-=============================================================
+╔══════════════════════════════════════════════════════════════╗
+║  🔮 紫微斗数 Agent v2.0 已启动                                 ║
+║  访问: http://127.0.0.1:8000                                 ║
+║  新特性: 流式输出 | 会话持久化 | 打字机效果 | 多会话管理        ║
+╚══════════════════════════════════════════════════════════════╝
 """)
